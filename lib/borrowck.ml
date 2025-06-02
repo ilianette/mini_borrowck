@@ -40,7 +40,8 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
     | _ -> ()
   in
 
-
+  (*(in particular) if pl: 'lft T = *&'lft_big pl'
+    then we should add the constraint 'lft_big : 'lft*)
   let rec beware_reborrow lft = function
     | PlDeref pl -> begin
         match typ_of_place prog mir pl with
@@ -52,10 +53,11 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
     | PlLocal _ -> ()
     | PlField (pl,_) -> beware_reborrow lft pl
   in
-(* the abstract type of a rvalue, all base types are understood as the unit one*)
+
+  (* Gives the type of an rvalue, creating lifetimes and adding constraints along the way. *)
   let approx_typ_of_rval = function
     | RVplace pl -> typ_of_place prog mir pl
-    | RVconst _ | RVunit -> Tunit (* we do not care anyway*) 
+    | RVconst _ | RVunit -> Tunit (*we do not care anyway*) 
     | RVborrow(mut, pl) ->
        let ty_pl = typ_of_place prog mir pl in
        let lft = fresh_lft () in
@@ -112,7 +114,15 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
 
   (* Run the live local analysis. See module Live_locals for documentation. *)
   let live_locals = Live_locals.go mir in
-
+  
+  (* DONE: generate living constraints:
+     - Add living constraints corresponding to the fact that liftimes appearing free
+       in the type of live locals at some program point should be alive at that
+       program point.
+     - Add living constraints corresponding to the fact that generic lifetime variables
+       (those in [mir.mgeneric_lfts]) should be alive during the whole execution of the
+       function.
+   *)
   for l = 0 to Array.length mir.minstrs -1 do
     List.iter (add_living (PpLocal l)) mir.mgeneric_lfts;
     
@@ -121,18 +131,11 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
         let t_var = typ_of_place prog mir (PlLocal var) in
         let lfts = free_lfts t_var in
         LSet.iter (add_living (PpLocal l)) lfts)
-    vars
+      vars
   done
-;
-  (* TODO: generate living constraints:
-     - Add living constraints corresponding to the fact that liftimes appearing free
-       in the type of live locals at some program point should be alive at that
-       program point.
-     - Add living constraints corresponding to the fact that generic lifetime variables
-       (those in [mir.mgeneric_lfts]) should be alive during the whole execution of the
-       function.
-  *)
-
+  ;
+  
+  
   (* If [lft] is a generic lifetime, [lft] is always alive at [PpInCaller lft]. *)
   List.iter (fun lft -> add_living (PpInCaller lft) lft) mir.mgeneric_lfts;
 
@@ -203,6 +206,11 @@ let borrowck prog mir =
 
   let lft_sets = compute_lft_sets prog mir in
 
+  (* DONE: check that outlives constraints declared in the prototype of the function are
+    enough to ensure safety. I.e., if [lft_sets lft] contains program point [PpInCaller lft'], this
+    means that we need that [lft] be alive when [lft'] dies, i.e., [lft'] outlives [lft]. This relation
+    has to be declared in [mir.outlives_graph]. *)
+
   (* message d'erreur piqué à Alexis. Merci ! *)
   let err lft_big lft =
   Error.error mir.mloc
@@ -220,11 +228,7 @@ let borrowck prog mir =
   in
 
   List.iter check mir.mgeneric_lfts;
-  (* TODO: check that outlives constraints declared in the prototype of the function are
-    enough to ensure safety. I.e., if [lft_sets lft] contains program point [PpInCaller lft'], this
-    means that we need that [lft] be alive when [lft'] dies, i.e., [lft'] outlives [lft]. This relation
-    has to be declared in [mir.outlives_graph]. *)
-
+  
   (* We check that we never perform any operation which would conflict with an existing
     borrows. *)
   let bor_active_at = Active_borrows.go prog lft_sets mir in
@@ -298,10 +302,20 @@ let borrowck prog mir =
       in
 
       match instr with
-      | Iassign (_, RVunop (_, pl), _) -> check_use pl
+      | Iassign (_, RVplace pl,_) | Iassign (_, RVunop (_, pl), _) -> check_use pl
+      | Iassign (_, RVbinop (_, pl1, pl2), _) ->
+         check_use pl1;
+         check_use pl2;
+      | Iassign (_, RVmake (_, pls), _) -> List.iter check_use pls
       | Iassign (_, RVborrow (mut, pl), _) ->
           if conflicting_borrow (mut = Mut) pl then
             Error.error loc "There is a borrow conflicting this borrow."
-      | _ -> () (* TODO: complete the other cases*)
+      | Iassign _ -> ()
+     
+      | Ideinit _  | Ireturn  | Igoto _ -> ()
+     
+      | Iif(pl, _, _) -> check_use pl
+      | Icall(_, pls, _, _) ->  List.iter check_use pls
+ 
     )
     mir.minstrs
