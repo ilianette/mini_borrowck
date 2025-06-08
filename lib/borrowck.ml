@@ -1,7 +1,3 @@
-(* Once you are done writing the code, remove this directive,
-   whose purpose is to disable several warnings. *)
-[@@@warning "-26-27"]
-
 open Type
 open Minimir
 open Active_borrows
@@ -26,10 +22,19 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
     (fun _ typ -> outlives := outlives_union !outlives (implied_outlives prog typ))
     mir.mlocals;
 
-  (*
-
-    x = truc
-   *)
+    (* DONE: generate these constraints by
+       - unifying types that need be equal (note that MiniRust does not support subtyping, that is,
+         if a variable x: &'a i32 is used as type &'b i32, then this requires that lifetimes 'a and
+         'b are equal),
+       - adding constraints required by function calls,
+       - generating constraints corresponding to reborrows. More precisely, if we create a borrow
+         of a place that dereferences  borrows, then the lifetime of the borrow we
+         create should be shorter than the lifetimes of the borrows the place dereference.
+         For example, if x: &'a &'b i32, and we create a borrow y = &**x of type &'c i32,
+         then 'c should be shorter than 'a and 'b.
+       
+    SUGGESTION: use functions [typ_of_place], [fields_types_fresh] and [fn_prototype_fresh].
+     *)
 
   let rec unify_lft_in_typ typ1 typ2 = match typ1, typ2 with
     | Tstruct(n1, lfts1), Tstruct(n2, lfts2) when n1 = n2 ->
@@ -57,17 +62,19 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
   (* Gives the type of an rvalue, creating lifetimes and adding constraints along the way. *)
   let approx_typ_of_rval = function
     | RVplace pl -> typ_of_place prog mir pl
-    | RVconst _ | RVunit -> Tunit (*we do not care anyway*) 
+    | RVconst _ | RVunit -> Tunit 
     | RVborrow(mut, pl) ->
-       let ty_pl = typ_of_place prog mir pl in
+       let t_pl = typ_of_place prog mir pl in
        let lft = fresh_lft () in
 
-       LSet.iter (fun lft_big -> add_outlives (lft_big, lft)) (free_lfts ty_pl);
+       LSet.iter (fun lft_big -> add_outlives (lft_big, lft)) (free_lfts t_pl);
        beware_reborrow lft pl;
-       Tborrow(lft, mut, ty_pl)
+       Tborrow(lft, mut, t_pl)
     | RVbinop _ | RVunop _ -> Tunit 
     | RVmake(name, pls) ->
-       fields_types_fresh prog name |> snd
+       let t_fields, t_struct = fields_types_fresh prog name in
+       List.iter2 unify_lft_in_typ t_fields (List.map (typ_of_place prog mir) pls);
+       t_struct
   in
 
   Array.iter
@@ -77,6 +84,7 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
          unify_lft_in_typ (typ_of_place prog mir pl) (approx_typ_of_rval rval)
       | Icall(f, pl_args, pl_ret, _) ->
          let ty_args, ty_ret, constraints = fn_prototype_fresh prog f in
+         
          unify_lft_in_typ (typ_of_place prog mir pl_ret) ty_ret;
          List.iter2 unify_lft_in_typ ty_args (List.map (typ_of_place prog mir) pl_args);
          List.iter add_outlives constraints
@@ -86,19 +94,6 @@ let compute_lft_sets prog mir : lifetime -> PpSet.t =
     
   (* Then, we add the outlives relations needed for the instructions to be safe. *)
 
-  (* TODO: generate these constraints by
-       - unifying types that need be equal (note that MiniRust does not support subtyping, that is,
-         if a variable x: &'a i32 is used as type &'b i32, then this requires that lifetimes 'a and
-         'b are equal),
-       - adding constraints required by function calls,
-       - generating constraints corresponding to reborrows. More precisely, if we create a borrow
-         of a place that dereferences  borrows, then the lifetime of the borrow we
-         create should be shorter than the lifetimes of the borrows the place dereference.
-         For example, if x: &'a &'b i32, and we create a borrow y = &**x of type &'c i32,
-         then 'c should be shorter than 'a and 'b.
-         ^ pourquoi
-    SUGGESTION: use functions [typ_of_place], [fields_types_fresh] and [fn_prototype_fresh].
-  *)
 
   (* The [living] variable contains constraints of the form "lifetime 'a should be
     alive at program point p". *)
@@ -219,10 +214,11 @@ let borrowck prog mir =
       (match lft with Ast.Lnamed s -> s | _ -> "")
   in
   
-  let check lft = 
+  let check lft =
+    let constraints = LMap.find lft mir.moutlives_graph in
     PpSet.iter (function
         | PpInCaller lft_big ->
-           if not (LSet.mem lft (LMap.find lft_big mir.moutlives_graph)) then
+           if not (LSet.mem lft_big constraints) then
              err lft_big lft
         | _ -> ()) (lft_sets lft)
   in

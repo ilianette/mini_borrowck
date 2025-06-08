@@ -58,12 +58,14 @@ let go prog mir : analysis_results =
   let deinitialize pl state = PlaceSet.union state (Hashtbl.find subplaces pl) in
 
   (* Effect of using (copying or moving) a place [pl] on the abstract state [state]. *)
+  (* task 1 *)
   let move_or_copy state pl =
     if typ_is_copy prog (typ_of_place prog mir pl)
     then state
-    else PlaceSet.add pl state
+    else deinitialize pl state
   in
-
+  (* not task 1 anymore *)
+  
   (* These modules are parameters of the [Fix.DataFlow.ForIntSegment] functor below. *)
   let module Instrs = struct let n = Array.length mir.minstrs end in
   let module Prop = struct
@@ -78,25 +80,34 @@ let go prog mir : analysis_results =
     (* To complete this module, one can read file active_borrows.ml, which contains a
       similar data flow analysis. *)
 
+    (* DONE *)
     let foreach_root go =
-      go mir.mentry all_places
+      (* We assume the arguments are initialized. *)
+      Hashtbl.fold (fun loc _ state ->
+           match loc with Lparam _ -> initialize (PlLocal loc) state | _ -> state)
+         mir.mlocals all_places
+      |> go mir.mentry
 
     let foreach_successor lbl state go =
       match fst mir.minstrs.(lbl) with
-      | Iassign(pl, RVplace(pl'), next) ->
-         move_or_copy state pl' |> initialize pl |> go next 
-      | Iassign(pl, _, next) ->
-         initialize pl state |> go next 
+      | Iassign(pl, rv, next) ->
+         let state = initialize pl state in
+          (match rv with
+          | RVplace(pl') -> move_or_copy state pl' 
+          | RVmake(_, pls) -> List.fold_left move_or_copy state pls 
+          | _ -> state (* unary and binary operations only calculate over copy types *))
+          |> go next
       | Ideinit(loc,next) -> 
          PlLocal loc |> Fun.flip deinitialize state |> go next
       | Igoto next -> go next state
-      | Iif(_, next1, next2) ->
-         go next1 state;
-         go next2 state
+      | Iif(pl, next1, next2) ->
+         let state' = move_or_copy state pl in
+         go next1 state';
+         go next2 state'
       | Ireturn -> ()
       | Icall(_, pls, plret, next) ->
-         (* Après l'appel, on a initialisé la valeur de retour et potentiellement désinitialisé les arguments.*)
-         List.fold_left move_or_copy (PlaceSet.remove plret state) pls |> go next
+         (* After the call, we've initialized the return value and maybe uninitialized the arguments *)
+         List.fold_left move_or_copy (initialize plret state) pls |> go next 
   end in
   let module Fix = Fix.DataFlow.ForIntSegment (Instrs) (Prop) (Graph) in
   fun i -> Option.value (Fix.solution i) ~default:PlaceSet.empty
